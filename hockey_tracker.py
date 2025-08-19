@@ -412,19 +412,8 @@ class HighSpeedTracker:
         self.prediction_weight = prediction_weight
         
     def update(self, detections, predictor=None, timestamp=None):
-        """
-        Update tracks with new detections
-        
-        Args:
-            detections: sv.Detections object
-            predictor: PuckPredictor for prediction-assisted tracking
-            timestamp: Current timestamp
-            
-        Returns:
-            sv.Detections with tracker_id assigned
-        """
+        """Update tracks with new detections"""
         if len(detections) == 0:
-            # Age all tracks
             self._age_tracks()
             return sv.Detections.empty()
         
@@ -458,10 +447,12 @@ class HighSpeedTracker:
             self.tracks[track_id]['disappeared'] = 0
             self.tracks[track_id]['last_seen'] = timestamp
             
-        # Create new tracks for unmatched detections
+        # Create new tracks for unmatched detections BEFORE calling _create_output_detections
+        new_track_ids = []
         for detection_idx in unmatched_detections:
             track_id = self.next_id
             self.next_id += 1
+            new_track_ids.append(track_id)
             
             self.tracks[track_id] = {
                 'center': detection_centers[detection_idx],
@@ -594,10 +585,6 @@ class HighSpeedTracker:
     def _create_output_detections(self, matched_tracks, unmatched_detections, 
                                 detection_bboxes, detection_confidences):
         """Create output detections with track IDs"""
-        if len(matched_tracks) == 0 and len(unmatched_detections) == 0:
-            return sv.Detections.empty()
-        
-        # Collect all detections (matched + unmatched)
         output_bboxes = []
         output_confidences = []
         output_track_ids = []
@@ -608,16 +595,28 @@ class HighSpeedTracker:
             output_confidences.append(detection_confidences[detection_idx])
             output_track_ids.append(track_id)
         
-        # Add unmatched detections (new tracks)
+        # Add unmatched detections (find their newly created track IDs)
         for detection_idx in unmatched_detections:
-            # Find the track ID we just created for this detection
-            # This is a bit hacky but works for our purposes
+            detection_bbox = detection_bboxes[detection_idx]
+            detection_conf = detection_confidences[detection_idx]
+            
+            # Find the track that was just created for this detection
+            found_track = None
             for track_id, track in self.tracks.items():
-                if (track['bbox'] == detection_bboxes[detection_idx]).all():
-                    output_bboxes.append(detection_bboxes[detection_idx])
-                    output_confidences.append(detection_confidences[detection_idx])
-                    output_track_ids.append(track_id)
+                # Compare centers instead of exact bbox arrays
+                det_center = ((detection_bbox[0] + detection_bbox[2]) / 2, 
+                            (detection_bbox[1] + detection_bbox[3]) / 2)
+                
+                if (abs(track['center'][0] - det_center[0]) < 1.0 and 
+                    abs(track['center'][1] - det_center[1]) < 1.0 and
+                    abs(track['confidence'] - detection_conf) < 0.01):
+                    found_track = track_id
                     break
+            
+            if found_track is not None:
+                output_bboxes.append(detection_bbox)
+                output_confidences.append(detection_conf)
+                output_track_ids.append(found_track)
         
         if len(output_bboxes) == 0:
             return sv.Detections.empty()
@@ -630,8 +629,7 @@ class HighSpeedTracker:
         detections.tracker_id = np.array(output_track_ids)
         
         return detections
-
-
+    
 class HockeyRinkAnalyzer:
     """
     Analyzes hockey rink geometry using net detections
@@ -2503,21 +2501,41 @@ class OnlineHockeyPuckTracker:
                 'total_tracked_points': sum(len(traj) for traj in self.trajectories.values())
             },
             'trajectories': {},
-            'metadata': dict(self.trajectory_metadata)
+            'metadata': {}
         }
         
+        # Helper function to convert numpy types to Python types
+        def convert_numpy_types(obj):
+            """Recursively convert numpy types to Python types"""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif hasattr(obj, 'item') and obj.size == 1:  # Single element numpy scalar
+                return obj.item()
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, set):
+                return list(obj)
+            elif isinstance(obj, tuple):
+                return list(obj)
+            elif isinstance(obj, dict):
+                return {str(k): convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            else:
+                return obj
+        
+        # Convert trajectory metadata keys to strings
+        for track_id, metadata in self.trajectory_metadata.items():
+            clean_metadata = convert_numpy_types(metadata)
+            trajectory_data['metadata'][str(track_id)] = clean_metadata
+        
+        # Convert trajectories
         for track_id, trajectory in self.trajectories.items():
-            # Convert all numpy types to Python types for JSON serialization
             clean_trajectory = []
             for point in trajectory:
-                clean_point = {}
-                for key, value in point.items():
-                    if hasattr(value, 'item'):  # NumPy scalar
-                        clean_point[key] = value.item()
-                    elif isinstance(value, np.ndarray):  # NumPy array
-                        clean_point[key] = value.tolist()
-                    else:
-                        clean_point[key] = value
+                clean_point = convert_numpy_types(point)
                 clean_trajectory.append(clean_point)
             trajectory_data['trajectories'][str(track_id)] = clean_trajectory
         
@@ -2525,9 +2543,14 @@ class OnlineHockeyPuckTracker:
         with open(json_path, 'w') as f:
             json.dump(trajectory_data, f, indent=2, default=str)
         
-        # Save detection data as well
+        # Save detection data with the same conversion
+        clean_detections = []
+        for detection in self.all_detections:
+            clean_detection = convert_numpy_types(detection)
+            clean_detections.append(clean_detection)
+        
         detection_data = {
-            'detections': self.all_detections,
+            'detections': clean_detections,
             'summary': {
                 'total_detections': len(self.all_detections),
                 'frames_with_detections': len(set(d['frame_num'] for d in self.all_detections)),
@@ -2541,7 +2564,8 @@ class OnlineHockeyPuckTracker:
         
         print(f"✅ Saved trajectory data: {json_path}")
         print(f"✅ Saved detection data: {detection_path}")
-    
+
+
     def print_summary(self):
         """Print comprehensive tracking summary"""
         print(f"\n" + "="*80)
