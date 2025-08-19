@@ -9,6 +9,84 @@ An advanced hockey puck tracking system that combines YOLO object detection, cus
 
 ![Hockey Tracking Demo](demo_image.png)
 
+## 🏗️ System Architecture
+
+The tracker uses a sophisticated multi-stage processing pipeline that combines AI-powered detection with contextual analysis:
+
+```
+INPUT VIDEO FRAME
+        │
+        ▼
+┌───────────────────┐
+│   NET DETECTION   │ ◄─── Net YOLO Model
+│   (Optional)      │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐      ┌─────────────────┐
+│  RINK ANALYSIS    │ ◄────┤ Net Positions   │
+│  • Zone mapping   │      │ • Left net      │
+│  • Goal lines     │      │ • Right net     │
+│  • Shooting angles│      │ • Confidence    │
+└─────────┬─────────┘      └─────────────────┘
+          │
+          ▼
+┌───────────────────┐
+│  PUCK DETECTION   │ ◄─── Puck YOLO Model
+│  Raw detections   │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐      ┌─────────────────┐
+│ CONTEXT FILTERING │ ◄────┤ Rink Knowledge  │
+│ • Remove net parts│      │ • Zone info     │
+│ • Size validation │      │ • Net positions │
+│ • Zone validation │      │ • Boundaries    │
+└─────────┬─────────┘      └─────────────────┘
+          │
+          ▼
+┌───────────────────┐      ┌─────────────────┐
+│   PREDICTION      │ ◄────┤ Track History   │
+│ • Generate missing│      │ • Past positions│
+│ • Enhance existing│      │ • Velocities    │
+│ • Fill gaps       │      │ • Patterns      │
+└─────────┬─────────┘      └─────────────────┘
+          │
+          ▼
+┌───────────────────┐      ┌─────────────────┐
+│   OBJECT TRACKING │ ◄────┤ Tracker State   │
+│ • Associate       │      │ • Active tracks │
+│ • Update tracks   │      │ • Track history │
+│ • Assign IDs      │      │ • Disappeared   │
+└─────────┬─────────┘      └─────────────────┘
+          │
+          ▼
+┌───────────────────┐      ┌─────────────────┐
+│ TRAJECTORY UPDATE │ ◄────┤ Track Metadata  │
+│ • Store positions │      │ • Colors        │
+│ • Add context     │      │ • Statistics    │
+│ • Update metadata │      │ • Zone visits   │
+└─────────┬─────────┘      └─────────────────┘
+          │
+          ▼
+┌───────────────────┐
+│   VISUALIZATION   │
+│ • Draw trajectories│
+│ • Show predictions │ 
+│ • Display context │
+│ • Annotate frame  │
+└─────────┬─────────┘
+          │
+          ▼
+    OUTPUT FRAME
+```
+
+This multi-stage approach ensures high accuracy by:
+1. **Context-Aware Detection**: Using rink geometry to filter false positives
+2. **Predictive Enhancement**: Filling gaps with intelligent predictions
+3. **Spatial Understanding**: Leveraging net positions for better tracking
+4. **Comprehensive Analysis**: Providing rich metadata for each trajectory
+
 ## 🚀 Features
 
 ### Core Tracking Capabilities
