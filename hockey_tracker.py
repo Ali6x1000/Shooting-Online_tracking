@@ -926,7 +926,7 @@ class OnlineHockeyPuckTracker:
         if use_high_speed_tracker:
             # Use our custom high-speed tracker
             self.tracker = HighSpeedTracker(
-                max_disappeared=30,  # 2 seconds at 30 FPS
+                max_disappeared=30,  # 1 seconds at 30 FPS
                 max_distance=200,    # Larger search radius for high-speed objects
                 prediction_weight=0.8 if enable_prediction else 0.0
             )
