@@ -1,3 +1,23 @@
+
+#run from terminal 
+# Basic usage with both models
+# python hockey_tracker.py shooting2.mp4 best_yolov11lv2_puck.pt Nets_n.pt
+
+# Full configuration
+# python hockey_tracker.py shooting2.mp4 best_yolov11lv2_puck.pt Nets_n.pt kalman high_speed
+
+# Without net model (fallback)
+# python hockey_tracker.py shooting2.mp4 best_yolov11lv2_puck.pt
+
+
+
+
+
+
+
+
+
+  
 def annotate_frame_with_predictions(self, frame, detections, timestamp):
         """Enhanced annotation showing predicted vs real detections"""
         annotated = frame.copy()
@@ -142,9 +162,7 @@ from pathlib import Path
 import json
 from scipy import interpolate
 from sklearn.linear_model import LinearRegression
-
-# You'll need to install these:
-# pip install ultralytics supervision opencv-python matplotlib scipy scikit-learn filterpy
+import torch
 
 try:
     from ultralytics import YOLO
@@ -614,6 +632,232 @@ class HighSpeedTracker:
         return detections
 
 
+class HockeyRinkAnalyzer:
+    """
+    Analyzes hockey rink geometry using net detections
+    Provides spatial context for improved puck tracking
+    """
+    
+    def __init__(self):
+        self.nets = []  # List of detected nets with positions
+        self.rink_zones = {}  # Offensive/defensive zones
+        self.goal_lines = []  # Goal line positions
+        self.rink_bounds = None  # Estimated rink boundaries
+        self.net_model = None  # YOLO model for net detection
+        
+    def load_net_model(self, net_model_path):
+        """Load YOLO model for net detection"""
+        try:
+            self.net_model = YOLO(net_model_path)
+            print(f"✅ Net detection model loaded: {net_model_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to load net model: {e}")
+            return False
+    
+    def detect_nets(self, frame):
+        """Detect nets in current frame"""
+        if self.net_model is None:
+            return []
+        
+        results = self.net_model.predict(frame, conf=0.3, verbose=False)
+        detections = sv.Detections.from_ultralytics(results[0])
+        
+        nets = []
+        for i in range(len(detections)):
+            bbox = detections.xyxy[i]
+            confidence = detections.confidence[i] if detections.confidence is not None else 0.0
+            
+            x1, y1, x2, y2 = bbox
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            width = x2 - x1
+            height = y2 - y1
+            
+            nets.append({
+                'bbox': bbox,
+                'center': (center_x, center_y),
+                'width': width,
+                'height': height,
+                'confidence': confidence
+            })
+        
+        return nets
+    
+    def update_rink_analysis(self, nets):
+        """Update rink analysis based on detected nets"""
+        if len(nets) == 0:
+            return
+        
+        # Store nets with temporal consistency
+        self.nets = nets
+        
+        # Analyze rink geometry
+        if len(nets) >= 2:
+            self._analyze_two_net_geometry(nets)
+        elif len(nets) == 1:
+            self._analyze_single_net_geometry(nets[0])
+    
+    def _analyze_two_net_geometry(self, nets):
+        """Analyze rink when both nets are visible"""
+        # Sort nets by x-position (left to right)
+        nets_sorted = sorted(nets, key=lambda n: n['center'][0])
+        left_net = nets_sorted[0]
+        right_net = nets_sorted[1]
+        
+        # Calculate rink dimensions
+        net_distance = abs(right_net['center'][0] - left_net['center'][0])
+        rink_center_x = (left_net['center'][0] + right_net['center'][0]) / 2
+        
+        # Define zones based on net positions
+        self.rink_zones = {
+            'left_offensive': (0, left_net['center'][0] + 50),
+            'left_defensive': (right_net['center'][0] - 50, float('inf')),
+            'neutral': (left_net['center'][0] + 50, right_net['center'][0] - 50),
+            'center_x': rink_center_x,
+            'net_distance': net_distance
+        }
+        
+        # Goal lines (approximate)
+        self.goal_lines = [
+            left_net['center'][0] + 20,  # Left goal line
+            right_net['center'][0] - 20   # Right goal line
+        ]
+        
+        print(f"📐 Rink analysis: Net distance={net_distance:.1f}px, Center={rink_center_x:.1f}")
+    
+    def _analyze_single_net_geometry(self, net):
+        """Analyze rink when only one net is visible"""
+        # Estimate rink based on single net
+        net_x = net['center'][0]
+        
+        # Assume standard rink proportions
+        if net_x < 400:  # Left side net
+            estimated_right_net_x = net_x + 800  # Estimate other net
+            self.rink_zones = {
+                'left_offensive': (0, net_x + 50),
+                'neutral': (net_x + 50, estimated_right_net_x - 50),
+                'center_x': (net_x + estimated_right_net_x) / 2
+            }
+        else:  # Right side net
+            estimated_left_net_x = net_x - 800
+            self.rink_zones = {
+                'right_defensive': (estimated_left_net_x + 50, net_x - 50),
+                'neutral': (estimated_left_net_x + 50, net_x - 50),
+                'center_x': (estimated_left_net_x + net_x) / 2
+            }
+    
+    def get_zone(self, x, y):
+        """Get rink zone for given position"""
+        if not self.rink_zones:
+            return 'unknown'
+        
+        if 'left_offensive' in self.rink_zones:
+            if x <= self.rink_zones['left_offensive'][1]:
+                return 'left_offensive'
+        
+        if 'left_defensive' in self.rink_zones:
+            if x >= self.rink_zones['left_defensive'][0]:
+                return 'left_defensive'
+        
+        if 'neutral' in self.rink_zones:
+            left_bound = self.rink_zones['neutral'][0]
+            right_bound = self.rink_zones['neutral'][1]
+            if left_bound <= x <= right_bound:
+                return 'neutral'
+        
+        return 'unknown'
+    
+    def calculate_shooting_angle(self, puck_x, puck_y, target_net=None):
+        """Calculate shooting angle from puck position to net"""
+        if not self.nets:
+            return None
+        
+        # Find closest net if not specified
+        if target_net is None:
+            min_distance = float('inf')
+            closest_net = None
+            for net in self.nets:
+                dist = np.sqrt((puck_x - net['center'][0])**2 + (puck_y - net['center'][1])**2)
+                if dist < min_distance:
+                    min_distance = dist
+                    closest_net = net
+            target_net = closest_net
+        
+        if target_net is None:
+            return None
+        
+        # Calculate angle
+        dx = target_net['center'][0] - puck_x
+        dy = target_net['center'][1] - puck_y
+        angle = np.degrees(np.arctan2(dy, dx))
+        
+        return {
+            'angle': angle,
+            'distance': np.sqrt(dx*dx + dy*dy),
+            'net_center': target_net['center']
+        }
+    
+    def is_goal_area(self, x, y, radius=50):
+        """Check if position is in goal area"""
+        for net in self.nets:
+            net_x, net_y = net['center']
+            distance = np.sqrt((x - net_x)**2 + (y - net_y)**2)
+            if distance <= radius:
+                return True
+        return False
+    
+    def get_puck_trajectory_context(self, trajectory_points):
+        """Analyze trajectory in context of rink geometry"""
+        if len(trajectory_points) < 2:
+            return {}
+        
+        context = {
+            'zones_visited': set(),
+            'goal_area_time': 0,
+            'shooting_opportunities': [],
+            'zone_transitions': [],
+            'average_zone': None
+        }
+        
+        prev_zone = None
+        goal_area_frames = 0
+        
+        for point in trajectory_points:
+            x, y = point['x'], point['y']
+            
+            # Track zones
+            zone = self.get_zone(x, y)
+            context['zones_visited'].add(zone)
+            
+            # Track zone transitions
+            if prev_zone and prev_zone != zone:
+                context['zone_transitions'].append({
+                    'from': prev_zone,
+                    'to': zone,
+                    'timestamp': point['timestamp']
+                })
+            prev_zone = zone
+            
+            # Track goal area time
+            if self.is_goal_area(x, y):
+                goal_area_frames += 1
+            
+            # Identify shooting opportunities
+            shooting_info = self.calculate_shooting_angle(x, y)
+            if shooting_info and shooting_info['distance'] < 200:  # Within shooting range
+                context['shooting_opportunities'].append({
+                    'timestamp': point['timestamp'],
+                    'position': (x, y),
+                    'angle': shooting_info['angle'],
+                    'distance': shooting_info['distance']
+                })
+        
+        context['goal_area_time'] = goal_area_frames / len(trajectory_points)
+        
+        return context
+
+
 class OnlineHockeyPuckTracker:
     """
     Online hockey puck tracker using YOLO detection + ByteTracker
@@ -621,31 +865,57 @@ class OnlineHockeyPuckTracker:
     """
     
     def __init__(self, yolo_model_path, confidence_threshold=0.1, 
-                 enable_prediction=True, prediction_method='kalman', use_high_speed_tracker=True):
+                 enable_prediction=True, prediction_method='kalman', use_high_speed_tracker=True,
+                 net_model_path=None):
         """
-        Initialize the online tracker with prediction capabilities
+        Initialize the online tracker with prediction capabilities and net detection
         
         Args:
-            yolo_model_path (str): Path to YOLO model file (.pt)
+            yolo_model_path (str): Path to YOLO model file (.pt) for puck detection
             confidence_threshold (float): Minimum confidence for detections
             enable_prediction (bool): Enable position prediction
             prediction_method (str): Method for prediction ('linear', 'polynomial', 'kalman')
             use_high_speed_tracker (bool): Use custom high-speed tracker instead of ByteTracker
+            net_model_path (str): Path to YOLO model for net detection (optional)
         """
-        print(f"🚀 Initializing Online Hockey Puck Tracker with Prediction")
-        print(f"   YOLO Model: {yolo_model_path}")
+        print(f"🚀 Initializing Enhanced Hockey Puck Tracker")
+        print(f"   Puck Model: {yolo_model_path}")
+        print(f"   Net Model: {net_model_path if net_model_path else 'Not provided'}")
         print(f"   Confidence Threshold: {confidence_threshold}")
         print(f"   Prediction Enabled: {enable_prediction}")
         print(f"   Prediction Method: {prediction_method if enable_prediction else 'N/A'}")
         print(f"   High-Speed Tracker: {use_high_speed_tracker}")
         
-        # Load YOLO model
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print(f"✅ Using MPS (Metal Performance Shaders) for GPU acceleration")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f"✅ Using CUDA for GPU acceleration")
+        else:
+            self.device = torch.device("cpu")
+            print(f"⚠️  Using CPU only - no GPU acceleration available")
+        
+        # Load YOLO model with explicit device
         try:
             self.model = YOLO(yolo_model_path)
-            print(f"✅ YOLO model loaded successfully")
+            # Move model to the appropriate device
+            self.model.to(self.device)
+            print(f"✅ YOLO model loaded on {self.device}")
         except Exception as e:
             print(f"❌ Failed to load YOLO model: {e}")
             raise
+
+
+
+        # Initialize rink analyzer with net detection
+        self.rink_analyzer = HockeyRinkAnalyzer()
+        if net_model_path:
+            self.rink_analyzer.load_net_model(net_model_path)
+            self.net_detection_enabled = True
+        else:
+            self.net_detection_enabled = False
+            print("⚠️ Net detection disabled - no net model provided")
         
         # Initialize prediction system
         self.enable_prediction = enable_prediction
@@ -656,8 +926,8 @@ class OnlineHockeyPuckTracker:
         if use_high_speed_tracker:
             # Use our custom high-speed tracker
             self.tracker = HighSpeedTracker(
-                max_disappeared=60,  # 2 seconds at 30 FPS
-                max_distance=150,    # Larger search radius for high-speed objects
+                max_disappeared=30,  # 2 seconds at 30 FPS
+                max_distance=200,    # Larger search radius for high-speed objects
                 prediction_weight=0.8 if enable_prediction else 0.0
             )
             print("✅ Using custom high-speed tracker")
@@ -693,6 +963,7 @@ class OnlineHockeyPuckTracker:
         
         # Track all detections for debugging
         self.all_detections = []  # For debugging purposes
+        self.net_detections = []  # Store net detections for analysis
         
         # Video processing state
         self.frame_count = 0
@@ -704,8 +975,351 @@ class OnlineHockeyPuckTracker:
         self.annotated_frames = []
         self.save_annotated_video = True
         
-        print(f"✅ Enhanced tracker initialized successfully")
+        print(f"✅ Enhanced tracker with net analysis initialized successfully")
     
+
+
+
+    def update_trajectories_with_context(self, detections, timestamp, nets):
+                """Enhanced trajectory update with rink context and prediction history"""
+                if not hasattr(detections, 'tracker_id') or detections.tracker_id is None or len(detections) == 0:
+                    return
+                    
+                for i in range(len(detections)):
+                    track_id = detections.tracker_id[i]
+                    bbox = detections.xyxy[i]
+                    confidence = detections.confidence[i] if detections.confidence is not None else 0.0
+                    
+                    # Calculate center point
+                    x1, y1, x2, y2 = bbox
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    bbox_size = max(x2 - x1, y2 - y1)
+                    
+                    # Update predictor history
+                    if self.enable_prediction:
+                        self.predictor.update_history(track_id, center_x, center_y, timestamp)
+                    
+                    # Store last known position for future predictions
+                    self.last_positions[track_id] = {
+                        'x': center_x,
+                        'y': center_y,
+                        'timestamp': timestamp,
+                        'bbox_size': bbox_size
+                    }
+                    
+                    # Determine if this was a predicted detection
+                    is_predicted = False
+                    for detection_data in self.all_detections:
+                        if (detection_data['frame_num'] == self.frame_count and 
+                            detection_data.get('predicted', False) and
+                            detection_data.get('track_id') == track_id):
+                            is_predicted = True
+                            break
+                    
+                    # Calculate rink context
+                    rink_context = {}
+                    if self.net_detection_enabled:
+                        rink_context['zone'] = self.rink_analyzer.get_zone(center_x, center_y)
+                        rink_context['in_goal_area'] = self.rink_analyzer.is_goal_area(center_x, center_y)
+                        
+                        # Calculate shooting angle if in offensive zone
+                        shooting_info = self.rink_analyzer.calculate_shooting_angle(center_x, center_y)
+                        if shooting_info:
+                            rink_context['shooting_angle'] = shooting_info['angle']
+                            rink_context['net_distance'] = shooting_info['distance']
+                            rink_context['can_shoot'] = shooting_info['distance'] < 200  # Within shooting range
+                    
+                    # Add to trajectory with enhanced context
+                    trajectory_point = {
+                        'x': float(center_x),
+                        'y': float(center_y),
+                        'bbox': bbox.tolist(),
+                        'confidence': float(confidence),
+                        'timestamp': timestamp,
+                        'frame_num': self.frame_count,
+                        'predicted': is_predicted,
+                        **rink_context  # Add all rink context data
+                    }
+                    
+                    self.trajectories[track_id].append(trajectory_point)
+                    
+                    # Update metadata with rink analysis
+                    if track_id not in self.trajectory_metadata:
+                        self.trajectory_metadata[track_id] = {
+                            'start_time': timestamp,
+                            'start_frame': self.frame_count,
+                            'color': self.generate_color(track_id),
+                            'zones_visited': set(),
+                            'goal_area_entries': 0,
+                            'shooting_opportunities': 0
+                        }
+                        print(f"New track started: ID {track_id}")
+                    
+                    # Update rink-specific metadata
+                    metadata = self.trajectory_metadata[track_id]
+                    metadata['end_time'] = timestamp
+                    metadata['end_frame'] = self.frame_count
+                    
+                    if self.net_detection_enabled and rink_context:
+                        if 'zone' in rink_context:
+                            metadata['zones_visited'].add(rink_context['zone'])
+                        
+                        if rink_context.get('in_goal_area', False):
+                            # Check if this is a new goal area entry
+                            if (len(self.trajectories[track_id]) > 1 and 
+                                not self.trajectories[track_id][-2].get('in_goal_area', False)):
+                                metadata['goal_area_entries'] += 1
+                        
+                        if rink_context.get('can_shoot', False):
+                            metadata['shooting_opportunities'] += 1
+            
+    def annotate_frame_with_context(self, frame, detections, nets, timestamp):
+            """Enhanced annotation with rink analysis and predictions"""
+            annotated = frame.copy()
+            
+            # Draw nets first (as background context)
+            if self.net_detection_enabled and len(nets) > 0:
+                for net in nets:
+                    bbox = net['bbox'].astype(int)
+                    x1, y1, x2, y2 = bbox
+                    confidence = net['confidence']
+                    
+                    # Draw net bounding box
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 3)  # Yellow for nets
+                    
+                    # Draw net center
+                    center = (int(net['center'][0]), int(net['center'][1]))
+                    cv2.circle(annotated, center, 8, (0, 255, 255), -1)
+                    
+                    # Label net
+                    cv2.putText(annotated, f"NET ({confidence:.2f})", (x1, y1 - 15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Draw rink zones if available
+            if self.net_detection_enabled and self.rink_analyzer.rink_zones:
+                self._draw_rink_zones(annotated)
+            
+            # Draw current puck detections
+            if len(detections) > 0 and hasattr(detections, 'tracker_id') and detections.tracker_id is not None:
+                for i in range(len(detections)):
+                    track_id = detections.tracker_id[i]
+                    bbox = detections.xyxy[i]
+                    confidence = detections.confidence[i] if detections.confidence is not None else 0.0
+                    
+                    x1, y1, x2, y2 = bbox.astype(int)
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+                    
+                    color = self.trajectory_metadata[track_id]['color']
+                    
+                    # Check if this is a predicted detection
+                    is_predicted = False
+                    for detection in self.all_detections:
+                        if (detection['frame_num'] == self.frame_count and 
+                            detection.get('predicted', False) and
+                            detection.get('track_id') == track_id):
+                            is_predicted = True
+                            break
+                    
+                    # Draw bounding box (dashed for predictions)
+                    if is_predicted:
+                        self._draw_dashed_rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        label = f"ID:{track_id} PRED ({confidence:.2f})"
+                    else:
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        label = f"ID:{track_id} ({confidence:.2f})"
+                    
+                    # Add rink context to label
+                    if self.net_detection_enabled:
+                        zone = self.rink_analyzer.get_zone(center_x, center_y)
+                        if zone != 'unknown':
+                            label += f" [{zone}]"
+                        
+                        if self.rink_analyzer.is_goal_area(center_x, center_y):
+                            label += " 🥅"
+                    
+                    # Add tracker type indicator
+                    tracker_type = "HS" if self.use_high_speed_tracker else "BT"
+                    label += f" [{tracker_type}]"
+                    
+                    # Draw center point
+                    cv2.circle(annotated, (center_x, center_y), 4, color, -1)
+                    
+                    # Draw shooting line to nearest net
+                    if self.net_detection_enabled and len(nets) > 0:
+                        shooting_info = self.rink_analyzer.calculate_shooting_angle(center_x, center_y)
+                        if shooting_info and shooting_info['distance'] < 300:
+                            net_center = shooting_info['net_center']
+                            cv2.line(annotated, (center_x, center_y), 
+                                    (int(net_center[0]), int(net_center[1])), 
+                                    (0, 255, 0), 1)  # Green shooting line
+                            
+                            # Add distance info
+                            dist_text = f"{shooting_info['distance']:.0f}px"
+                            cv2.putText(annotated, dist_text, (center_x + 10, center_y + 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                    
+                    # Draw label
+                    cv2.putText(annotated, label, (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Draw trajectories with enhanced context
+            for track_id, trajectory in self.trajectories.items():
+                if len(trajectory) < 2:
+                    continue
+                
+                color = self.trajectory_metadata[track_id]['color']
+                
+                # Separate real and predicted points
+                real_points = [(int(p['x']), int(p['y'])) for p in trajectory if not p.get('predicted', False)]
+                pred_points = [(int(p['x']), int(p['y'])) for p in trajectory if p.get('predicted', False)]
+                
+                # Draw real trajectory (solid lines)
+                if len(real_points) > 1:
+                    for i in range(1, len(real_points)):
+                        cv2.line(annotated, real_points[i-1], real_points[i], color, 2)
+                
+                # Draw predicted trajectory (dashed lines)
+                if len(pred_points) > 1:
+                    for i in range(1, len(pred_points)):
+                        self._draw_dashed_line(annotated, pred_points[i-1], pred_points[i], color, 2)
+                
+                # Draw ALL points in trajectory as continuous line
+                all_points = [(int(p['x']), int(p['y'])) for p in trajectory]
+                if len(all_points) > 1:
+                    # Draw start point (green circle)
+                    cv2.circle(annotated, all_points[0], 6, (0, 255, 0), -1)
+                    cv2.circle(annotated, all_points[0], 6, (0, 0, 0), 1)
+                    
+                    # Draw end point (red circle) 
+                    cv2.circle(annotated, all_points[-1], 6, (0, 0, 255), -1)
+                    cv2.circle(annotated, all_points[-1], 6, (0, 0, 0), 1)
+                    
+                    # Draw direction arrow at midpoint
+                    if len(all_points) > 2:
+                        mid_idx = len(all_points) // 2
+                        if mid_idx < len(all_points) - 1:
+                            dx = all_points[mid_idx + 1][0] - all_points[mid_idx][0]
+                            dy = all_points[mid_idx + 1][1] - all_points[mid_idx][1]
+                            if dx != 0 or dy != 0:
+                                length = np.sqrt(dx*dx + dy*dy)
+                                if length > 0:
+                                    dx = dx / length * 20
+                                    dy = dy / length * 20
+                                    cv2.arrowedLine(annotated, all_points[mid_idx], 
+                                                (int(all_points[mid_idx][0] + dx), int(all_points[mid_idx][1] + dy)), 
+                                                color, 2, tipLength=0.3)
+                
+                # Draw prediction indicators
+                if self.enable_prediction and track_id in self.last_positions:
+                    last_pos = self.last_positions[track_id]
+                    pred_x, pred_y, confidence = self.predictor.predict_position(track_id, timestamp + 0.1)
+                    if pred_x is not None:
+                        future_point = (int(pred_x), int(pred_y))
+                        current_point = (int(last_pos['x']), int(last_pos['y']))
+                        self._draw_dashed_line(annotated, current_point, future_point, (255, 255, 0), 1)
+                        cv2.circle(annotated, future_point, 3, (255, 255, 0), -1)
+            
+            # Enhanced frame info with net and rink context
+            total_trajectories = len(self.trajectories)
+            active_trajectories = len([t for t in self.trajectories.values() 
+                                    if len(t) > 0 and abs(t[-1]['timestamp'] - timestamp) < 1.0])
+            predicted_count = len([d for d in self.all_detections 
+                                if d['frame_num'] == self.frame_count and d.get('predicted', False)])
+            
+            tracker_name = "High-Speed" if self.use_high_speed_tracker else "ByteTracker"
+            net_info = f"Nets: {len(nets)}" if self.net_detection_enabled else "No Net Detection"
+            
+            info_text = f"Frame: {self.frame_count} | Time: {timestamp:.2f}s | {tracker_name} | {net_info} | Pucks: {len(detections)} | Pred: {predicted_count} | Tracks: {total_trajectories}/{active_trajectories}"
+            
+            # Draw info with background
+            cv2.putText(annotated, info_text, (10, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(annotated, info_text, (10, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Enhanced legend
+            legend_y = 50
+            legend_text = "🏒Green=Start,Red=End,Yellow=Net,Solid=Real,Dash=Pred,🥅=Goal Area"
+            cv2.putText(annotated, legend_text, (10, legend_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)
+            cv2.putText(annotated, legend_text, (10, legend_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+            
+            return annotated
+        
+    def _draw_rink_zones(self, frame):
+            """Draw rink zone boundaries"""
+            if not self.rink_analyzer.rink_zones:
+                return
+            
+            zones = self.rink_analyzer.rink_zones
+            height = frame.shape[0]
+            
+            # Draw zone boundaries as semi-transparent overlays
+            overlay = frame.copy()
+            
+            # Neutral zone
+            if 'neutral' in zones:
+                left, right = zones['neutral']
+                cv2.rectangle(overlay, (int(left), 0), (int(right), height), (100, 100, 100), -1)
+            
+            # Offensive zones (different colors)
+            if 'left_offensive' in zones:
+                _, right = zones['left_offensive']
+                cv2.rectangle(overlay, (0, 0), (int(right), height), (100, 200, 100), -1)
+            
+            if 'left_defensive' in zones:
+                left, _ = zones['left_defensive']
+                cv2.rectangle(overlay, (int(left), 0), (frame.shape[1], height), (200, 100, 100), -1)
+            
+            # Blend with original frame
+            cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
+            
+            # Draw zone lines
+            if 'neutral' in zones:
+                left, right = zones['neutral']
+                cv2.line(frame, (int(left), 0), (int(left), height), (255, 255, 255), 2)
+                cv2.line(frame, (int(right), 0), (int(right), height), (255, 255, 255), 2)
+        
+    def analyze_trajectory_with_rink_context(self, track_id):
+            """Comprehensive trajectory analysis using rink context"""
+            if track_id not in self.trajectories or not self.net_detection_enabled:
+                return {}
+            
+            trajectory = self.trajectories[track_id]
+            context = self.rink_analyzer.get_puck_trajectory_context(trajectory)
+            
+            # Add our own analysis
+            analysis = {
+                'track_id': track_id,
+                'duration': trajectory[-1]['timestamp'] - trajectory[0]['timestamp'],
+                'total_points': len(trajectory),
+                'real_points': len([p for p in trajectory if not p.get('predicted', False)]),
+                'predicted_points': len([p for p in trajectory if p.get('predicted', False)]),
+                **context
+            }
+            
+            # Calculate advanced metrics
+            if len(trajectory) > 1:
+                # Speed analysis
+                speeds = []
+                for i in range(1, len(trajectory)):
+                    dx = trajectory[i]['x'] - trajectory[i-1]['x']
+                    dy = trajectory[i]['y'] - trajectory[i-1]['y']
+                    dt = trajectory[i]['timestamp'] - trajectory[i-1]['timestamp']
+                    if dt > 0:
+                        speed = np.sqrt(dx*dx + dy*dy) / dt
+                        speeds.append(speed)
+                
+                if speeds:
+                    analysis['avg_speed'] = np.mean(speeds)
+                    analysis['max_speed'] = np.max(speeds)
+                    analysis['speed_changes'] = len([i for i in range(1, len(speeds)) 
+                                                if abs(speeds[i] - speeds[i-1]) > 50])
+            
+            return analysis  
     def process_video(self, video_path, output_dir="hockey_tracking_results", 
                      save_frames=True, save_video=True, max_frames=None):
         """
@@ -820,7 +1434,7 @@ class OnlineHockeyPuckTracker:
     
     def process_frame(self, frame, timestamp):
         """
-        Process a single frame with enhanced prediction capabilities
+        Process a single frame with enhanced prediction and net analysis
         
         Args:
             frame (np.ndarray): Current video frame
@@ -829,7 +1443,24 @@ class OnlineHockeyPuckTracker:
         Returns:
             np.ndarray: Annotated frame
         """
-        # YOLO detection
+        # Detect nets first for spatial context
+        nets = []
+        if self.net_detection_enabled:
+            nets = self.rink_analyzer.detect_nets(frame)
+            self.rink_analyzer.update_rink_analysis(nets)
+            
+            # Store net detections for analysis
+            for net in nets:
+                net_data = {
+                    'frame_num': self.frame_count,
+                    'timestamp': timestamp,
+                    'bbox': net['bbox'],
+                    'center': net['center'],
+                    'confidence': net['confidence']
+                }
+                self.net_detections.append(net_data)
+        
+        # YOLO puck detection
         results = self.model.predict(
             frame, 
             conf=self.confidence_threshold,
@@ -838,6 +1469,10 @@ class OnlineHockeyPuckTracker:
         
         # Convert to supervision format and check for detections
         detections = sv.Detections.from_ultralytics(results[0])
+        
+        # Filter detections based on rink context
+        if self.net_detection_enabled and len(detections) > 0:
+            detections = self._filter_detections_by_rink_context(detections, nets)
         
         # Debug: Store all raw detections
         for i in range(len(detections)):
@@ -849,9 +1484,17 @@ class OnlineHockeyPuckTracker:
                 'class_id': detections.class_id[i] if detections.class_id is not None else 0,
                 'predicted': False
             }
+            
+            # Add rink context if available
+            if self.net_detection_enabled:
+                center_x = (detections.xyxy[i][0] + detections.xyxy[i][2]) / 2
+                center_y = (detections.xyxy[i][1] + detections.xyxy[i][3]) / 2
+                detection_data['zone'] = self.rink_analyzer.get_zone(center_x, center_y)
+                detection_data['in_goal_area'] = self.rink_analyzer.is_goal_area(center_x, center_y)
+            
             self.all_detections.append(detection_data)
         
-        print(f"Frame {self.frame_count}: Found {len(detections)} raw detections")
+        print(f"Frame {self.frame_count}: Found {len(nets)} nets, {len(detections)} puck detections")
         
         # Add predicted detections when no real detections found
         if self.enable_prediction and len(detections) == 0:
@@ -899,13 +1542,72 @@ class OnlineHockeyPuckTracker:
             else:
                 detections = self.tracker.update_with_detections(sv.Detections.empty())
         
-        # Update trajectories with prediction support
-        self.update_trajectories_with_prediction(detections, timestamp)
+        # Update trajectories with prediction and rink context
+        self.update_trajectories_with_context(detections, timestamp, nets)
         
-        # Create annotated frame with prediction visualization
-        annotated_frame = self.annotate_frame_with_predictions(frame, detections, timestamp)
+        # Create annotated frame with prediction visualization and rink analysis
+        annotated_frame = self.annotate_frame_with_context(frame, detections, nets, timestamp)
         
         return annotated_frame
+    
+    def _filter_detections_by_rink_context(self, detections, nets):
+        """Filter puck detections based on rink geometry and context"""
+        if len(detections) == 0 or len(nets) == 0:
+            return detections
+        
+        # Create masks for filtering
+        valid_indices = []
+        
+        for i in range(len(detections)):
+            bbox = detections.xyxy[i]
+            center_x = (bbox[0] + bbox[2]) / 2
+            center_y = (bbox[1] + bbox[3]) / 2
+            confidence = detections.confidence[i] if detections.confidence is not None else 0.0
+            
+            # Basic validity checks
+            is_valid = True
+            
+            # Filter out detections that are too close to nets (likely net parts, not puck)
+            min_net_distance = float('inf')
+            for net in nets:
+                net_x, net_y = net['center']
+                distance = np.sqrt((center_x - net_x)**2 + (center_y - net_y)**2)
+                min_net_distance = min(min_net_distance, distance)
+            
+            # Puck should not be inside the net structure
+            if min_net_distance < 30:  # pixels
+                print(f"  Filtered detection too close to net: {min_net_distance:.1f}px")
+                is_valid = False
+            
+            # Size filtering - puck should be smaller than net
+            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            if len(nets) > 0:
+                avg_net_area = np.mean([net['width'] * net['height'] for net in nets])
+                if bbox_area > avg_net_area * 0.3:  # Puck shouldn't be > 30% of net size
+                    print(f"  Filtered detection too large: {bbox_area:.1f} vs {avg_net_area:.1f}")
+                    is_valid = False
+            
+            # Zone-based filtering (if we have good rink analysis)
+            zone = self.rink_analyzer.get_zone(center_x, center_y)
+            if zone == 'unknown':
+                # If detection is in unknown zone, reduce confidence but don't eliminate
+                confidence *= 0.7
+            
+            if is_valid:
+                valid_indices.append(i)
+        
+        # Filter detections
+        if len(valid_indices) == 0:
+            return sv.Detections.empty()
+        
+        filtered_detections = sv.Detections(
+            xyxy=detections.xyxy[valid_indices],
+            confidence=detections.confidence[valid_indices] if detections.confidence is not None else None,
+            class_id=detections.class_id[valid_indices] if detections.class_id is not None else None
+        )
+        
+        print(f"  Filtered {len(detections)} -> {len(filtered_detections)} detections using rink context")
+        return filtered_detections
     
     def _generate_predicted_detections(self, timestamp):
         """Generate predicted detections for tracks that might be temporarily lost"""
@@ -1103,7 +1805,7 @@ class OnlineHockeyPuckTracker:
                 print(f"New track started: ID {track_id}")
             
             self.trajectory_metadata[track_id]['end_time'] = timestamp
-            self.trajectory_metadata[track_id]['end_frame'] = self.frame_count
+            self.trajectory_metadata[track_id]['end_frame'] = self.frame_countections.confidence[i] if detections.confidence is not None else 0.0
             
             # Calculate center point
             x1, y1, x2, y2 = bbox
@@ -1893,160 +2595,201 @@ class OnlineHockeyPuckTracker:
 
 def main():
     """
-    Enhanced main function with high-speed tracking capabilities
+    Enhanced main function with net detection and rink analysis
     """
     import sys
     
     if len(sys.argv) < 3:
-        print("Usage: python hockey_tracker.py <video_path> <yolo_model_path> [prediction_method] [tracker_type]")
-        print("Prediction methods: linear, polynomial, kalman (default)")
-        print("Tracker types: high_speed (default), bytetrack")
-        print("Example: python hockey_tracker.py hockey_video.mp4 yolov8n.pt kalman high_speed")
+        print("Usage: python hockey_tracker.py <video_path> <puck_model_path> [net_model_path] [prediction_method] [tracker_type]")
+        print("Arguments:")
+        print("  video_path: Path to hockey video")
+        print("  puck_model_path: Path to YOLO model for puck detection")
+        print("  net_model_path: Path to YOLO model for net detection (optional)")
+        print("  prediction_method: linear, polynomial, kalman (default)")
+        print("  tracker_type: high_speed (default), bytetrack")
+        print("\nExamples:")
+        print("  python hockey_tracker.py video.mp4 puck_model.pt")
+        print("  python hockey_tracker.py video.mp4 puck_model.pt net_model.pt kalman high_speed")
         sys.exit(1)
     
     video_path = sys.argv[1]
-    yolo_model_path = sys.argv[2]
-    prediction_method = sys.argv[3] if len(sys.argv) > 3 else 'kalman'
-    tracker_type = sys.argv[4] if len(sys.argv) > 4 else 'high_speed'
+    puck_model_path = sys.argv[2]
+    net_model_path = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] != 'kalman' and sys.argv[3] != 'linear' and sys.argv[3] != 'polynomial' else None
+    
+    # Handle argument parsing
+    remaining_args = sys.argv[4:] if net_model_path else sys.argv[3:]
+    prediction_method = 'kalman'
+    tracker_type = 'high_speed'
+    
+    for arg in remaining_args:
+        if arg in ['linear', 'polynomial', 'kalman']:
+            prediction_method = arg
+        elif arg in ['high_speed', 'bytetrack']:
+            tracker_type = arg
     
     # Verify files exist
     if not os.path.exists(video_path):
         print(f"❌ Video file not found: {video_path}")
         sys.exit(1)
     
-    if not os.path.exists(yolo_model_path):
-        print(f"❌ YOLO model file not found: {yolo_model_path}")
+    if not os.path.exists(puck_model_path):
+        print(f"❌ Puck model file not found: {puck_model_path}")
         print("You can download a model with: from ultralytics import YOLO; YOLO('yolov8n.pt')")
         sys.exit(1)
     
+    if net_model_path and not os.path.exists(net_model_path):
+        print(f"⚠️ Net model file not found: {net_model_path}")
+        print("Continuing without net detection...")
+        net_model_path = None
+    
     use_high_speed = tracker_type.lower() == 'high_speed'
     
-    print("🚀 Starting Enhanced Hockey Puck Tracking with High-Speed Support")
-    print("="*70)
+    print("🚀 Starting Enhanced Hockey Puck Tracking with Rink Analysis")
+    print("="*75)
     print(f"📹 Video: {video_path}")
-    print(f"🤖 Model: {yolo_model_path}")
+    print(f"🏒 Puck Model: {puck_model_path}")
+    print(f"🥅 Net Model: {net_model_path if net_model_path else 'Not provided'}")
     print(f"🔮 Prediction: {prediction_method}")
     print(f"🏃 Tracker: {'High-Speed Custom' if use_high_speed else 'ByteTracker'}")
-    print("="*70)
+    print("="*75)
     
-    # Create enhanced tracker with high-speed support
+    # Create enhanced tracker with net detection and rink analysis
     tracker = OnlineHockeyPuckTracker(
-        yolo_model_path=yolo_model_path,
+        yolo_model_path=puck_model_path,
         confidence_threshold=0.05,  # Lower threshold for better detection
         enable_prediction=True,
         prediction_method=prediction_method,
-        use_high_speed_tracker=use_high_speed
+        use_high_speed_tracker=use_high_speed,
+        net_model_path=net_model_path  # 🥅 New parameter for net detection!
     )
     
     # Process video
     trajectories = tracker.process_video(
         video_path=video_path,
-        output_dir="high_speed_hockey_tracking_results",
+        output_dir="rink_aware_hockey_tracking_results",
         save_frames=True,
         save_video=True,
-        max_frames=None  # Process entire video
+        max_frames=None
     )
     
     # Fill gaps using prediction
     tracker.fill_trajectory_gaps(max_gap_duration=0.3)
     
-    # Filter trajectories with more permissive settings
+    # Filter trajectories
     filtered_trajectories = tracker.filter_trajectories(
         min_length=3,       # Even lower for high-speed tracking
         min_duration=0.1,   # Very short duration threshold
         min_movement=5      # Lower movement threshold
     )
     
-    # Create visualizations
-    tracker.create_trajectory_plots("high_speed_hockey_tracking_results")
+    # Create visualizations with rink analysis
+    tracker.create_trajectory_plots("rink_aware_hockey_tracking_results")
     
-    # Print summary
+    # Perform rink-aware analysis for each trajectory
+    if tracker.net_detection_enabled:
+        print(f"\n🏒 RINK-AWARE TRAJECTORY ANALYSIS:")
+        print("="*50)
+        
+        for track_id in filtered_trajectories.keys():
+            analysis = tracker.analyze_trajectory_with_rink_context(track_id)
+            
+            print(f"\n📊 Track {track_id} Analysis:")
+            print(f"   Duration: {analysis.get('duration', 0):.2f}s")
+            print(f"   Points: {analysis.get('total_points', 0)} (Real: {analysis.get('real_points', 0)}, Pred: {analysis.get('predicted_points', 0)})")
+            print(f"   Zones Visited: {', '.join(analysis.get('zones_visited', set()))}")
+            print(f"   Goal Area Entries: {analysis.get('goal_area_entries', 0)}")
+            print(f"   Shooting Opportunities: {analysis.get('shooting_opportunities', 0)}")
+            
+            if 'avg_speed' in analysis:
+                print(f"   Avg Speed: {analysis['avg_speed']:.1f} px/s")
+                print(f"   Max Speed: {analysis['max_speed']:.1f} px/s")
+                print(f"   Speed Changes: {analysis.get('speed_changes', 0)}")
+    
+    # Print summary with rink context
     tracker.print_summary()
     
-    print(f"\n🎉 HIGH-SPEED TRACKING COMPLETE!")
-    print(f"📁 Results saved to: high_speed_hockey_tracking_results/")
-    print(f"📊 Check the following outputs:")
-    print(f"   - annotated_hockey_tracking.mp4 (video with high-speed trajectories)")
-    print(f"   - all_trajectories_overview.png (overview plot)")
-    print(f"   - individual_trajectories/ (detailed plots for each track)")
-    print(f"   - trajectory_statistics.png (statistical analysis)")
+    print(f"\n🎉 RINK-AWARE TRACKING COMPLETE!")
+    print(f"📁 Results saved to: rink_aware_hockey_tracking_results/")
+    print(f"📊 Enhanced outputs with rink analysis:")
+    print(f"   - annotated_hockey_tracking.mp4 (video with nets, zones, and trajectories)")
+    print(f"   - all_trajectories_overview.png (overview with rink context)")
+    print(f"   - individual_trajectories/ (detailed plots with rink analysis)")
+    print(f"   - trajectory_statistics.png (stats including rink metrics)")
     print(f"   - temporal_analysis.png (time-based analysis)")
     print(f"   - detection_analysis.png (detection vs tracking analysis)")
-    print(f"   - trajectory_data.json (raw trajectory data)")
-    print(f"   - detection_data.json (raw detection data)")
+    print(f"   - trajectory_data.json (trajectory data with rink context)")
+    print(f"   - detection_data.json (detection data)")
     
-    # Performance comparison if both trackers were tested
-    if use_high_speed:
-        print(f"\n🚀 HIGH-SPEED TRACKER BENEFITS:")
-        print(f"   ✅ Better association for fast-moving objects")
-        print(f"   ✅ Larger search radius (150px vs ByteTracker's ~50px)")
-        print(f"   ✅ Prediction-assisted association")
-        print(f"   ✅ Custom cost function optimized for pucks")
-        print(f"   ✅ Reduced track fragmentation")
+    # Benefits summary
+    if tracker.net_detection_enabled:
+        print(f"\n🥅 NET DETECTION BENEFITS:")
+        print(f"   ✅ Spatial context for better tracking")
+        print(f"   ✅ False positive filtering (removes net detections)")
+        print(f"   ✅ Zone-based trajectory analysis")
+        print(f"   ✅ Shooting angle and distance calculations") 
+        print(f"   ✅ Goal area detection and analysis")
+        print(f"   ✅ Rink geometry understanding")
     
     return tracker, trajectories
 
 
-# Standalone usage example with high-speed support
-def example_usage():
+# Enhanced example usage with net detection
+def example_usage_with_nets():
     """
-    Example of how to use the enhanced high-speed tracker programmatically
+    Example of using the tracker with both puck and net detection
     """
-    # Initialize enhanced tracker with high-speed tracking
+    # Initialize tracker with both models
     tracker = OnlineHockeyPuckTracker(
-        yolo_model_path="yolov8n.pt",  # Download automatically if not present
-        confidence_threshold=0.05,  # Lower threshold
+        yolo_model_path="puck_model.pt",
+        confidence_threshold=0.05,
         enable_prediction=True,
-        prediction_method='kalman',  # Best prediction method
-        use_high_speed_tracker=True  # Use high-speed tracker
+        prediction_method='kalman',
+        use_high_speed_tracker=True,
+        net_model_path="net_model.pt"  # 🥅 Net detection model
     )
     
-    # Process video
+    # Process video with full rink awareness
     trajectories = tracker.process_video(
-        video_path="hockey_video.mp4",
-        output_dir="my_high_speed_hockey_results",
+        video_path="hockey_game.mp4",
+        output_dir="full_rink_analysis",
         save_frames=True,
         save_video=True
     )
     
-    # Fill trajectory gaps using prediction
+    # Fill gaps and filter
     tracker.fill_trajectory_gaps(max_gap_duration=0.3)
-    
-    # Filter trajectories with high-speed friendly settings
     good_trajectories = tracker.filter_trajectories(
-        min_length=5,       # Lower threshold for high-speed
-        min_duration=0.2,   # Shorter duration
-        min_movement=10     # Lower movement threshold
+        min_length=5,
+        min_duration=0.2,
+        min_movement=10
     )
     
-    # Create all visualizations
-    tracker.create_trajectory_plots("my_high_speed_hockey_results")
-    
-    # Access trajectory data programmatically
+    # Analyze each trajectory with rink context
     for track_id, trajectory in good_trajectories.items():
-        real_points = [p for p in trajectory if not p.get('predicted', False)]
-        pred_points = [p for p in trajectory if p.get('predicted', False)]
+        analysis = tracker.analyze_trajectory_with_rink_context(track_id)
         
-        # Calculate velocity statistics
-        if len(real_points) > 1:
-            total_distance = 0
-            for i in range(1, len(real_points)):
-                dx = real_points[i]['x'] - real_points[i-1]['x']
-                dy = real_points[i]['y'] - real_points[i-1]['y']
-                total_distance += np.sqrt(dx*dx + dy*dy)
-            
-            duration = real_points[-1]['timestamp'] - real_points[0]['timestamp']
-            avg_velocity = total_distance / duration if duration > 0 else 0
-            
-            print(f"Track {track_id}:")
-            print(f"  Duration: {tracker.trajectory_metadata[track_id]['duration']:.2f}s")
-            print(f"  Average Velocity: {avg_velocity:.1f} px/s")
-            print(f"  Total Points: {len(trajectory)}")
-            print(f"  Real Points: {len(real_points)}")
-            print(f"  Predicted Points: {len(pred_points)}")
-            print(f"  Prediction Ratio: {len(pred_points)/len(trajectory)*100:.1f}%")
+        print(f"\n🏒 Track {track_id} - Rink Analysis:")
+        print(f"   Zones: {', '.join(analysis.get('zones_visited', set()))}")
+        print(f"   Goal Scoring Chances: {analysis.get('shooting_opportunities', 0)}")
+        print(f"   Zone Transitions: {len(analysis.get('zone_transitions', []))}")
+        print(f"   Time in Goal Area: {analysis.get('goal_area_time', 0)*100:.1f}%")
+        
+        # Identify potential goals or scoring plays
+        if analysis.get('goal_area_entries', 0) > 0:
+            print(f"   🎯 POTENTIAL SCORING PLAY - {analysis['goal_area_entries']} goal area entries!")
+        
+        if analysis.get('avg_speed', 0) > 200:  # High speed threshold
+            print(f"   ⚡ HIGH-SPEED PLAY - Avg speed: {analysis['avg_speed']:.1f} px/s")
+    tracker.create_trajectory_plots("full_rink_analysis")
+    return tracker, trajectories    
+    # Create visualizations
+   
     
     return tracker, trajectories
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
