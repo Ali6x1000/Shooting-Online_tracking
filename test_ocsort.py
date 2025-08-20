@@ -321,6 +321,32 @@ class HockeyPuckTracker:
         if not self.is_in_lower_third(trajectory[0]['y']):
             return False
         
+        # ADD: Minimum movement distance requirement
+        start_point = trajectory[0]
+        end_point = trajectory[-1]
+        total_distance = math.sqrt(
+            (end_point['x'] - start_point['x'])**2 + 
+            (end_point['y'] - start_point['y'])**2
+        )
+        
+        if total_distance < 50:  # Require at least 50 pixels of movement
+            return False
+        
+        # ADD: Check for consistent forward movement
+        moving_distance = 0
+        for i in range(1, len(trajectory)):
+            prev = trajectory[i-1]
+            curr = trajectory[i]
+            moving_distance += math.sqrt(
+                (curr['x'] - prev['x'])**2 + 
+                (curr['y'] - prev['y'])**2
+            )
+        
+        # If total path distance is much longer than straight-line distance,
+        # it's probably not a shot (too much back-and-forth movement)
+        if moving_distance > total_distance * 3:
+            return False
+        
         # Must move toward net
         if not self.is_moving_toward_net(trajectory, nets):
             return False
@@ -356,14 +382,19 @@ class HockeyPuckTracker:
             best_shot = self.select_best_shot_from_active(self.net_positions)
             if best_shot:
                 track_id, trajectory = best_shot
-                self.selected_shots.append({
-                    'track_id': track_id,
-                    'trajectory': trajectory,
-                    'start_frame': trajectory[0]['frame_num'] if trajectory else self.frame_count,
-                    'end_frame': trajectory[-1]['frame_num'] if trajectory else self.frame_count,
-                    'color': self.generate_color(len(self.selected_shots))
-                })
-                print(f"Selected shot: Track {track_id} with {len(trajectory)} points")
+                
+                # ADD: Prevent duplicate shots from same track
+                if not any(shot['track_id'] == track_id for shot in self.selected_shots):
+                    self.selected_shots.append({
+                        'track_id': track_id,
+                        'trajectory': trajectory,
+                        'start_frame': trajectory[0]['frame_num'] if trajectory else self.frame_count,
+                        'end_frame': trajectory[-1]['frame_num'] if trajectory else self.frame_count,
+                        'color': self.generate_color(len(self.selected_shots))
+                    })
+                    print(f"Selected shot: Track {track_id} with {len(trajectory)} points")
+                else:
+                    print(f"Skipping duplicate track {track_id}")
         
         # Clear active trajectories for next shot
         self.active_trajectories.clear()
