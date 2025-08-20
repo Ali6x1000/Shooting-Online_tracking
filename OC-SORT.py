@@ -12,6 +12,7 @@ python OC-SORT.py shooting2.mp4 best_yolov11lv2_puck.pt --net-model Nets_n.pt
 python OC-SORT.py shooting2.mp4 best_yolov11lv2_puck.pt --net-model Nets_n.pt --shot-analysis
 """
 
+from trackers.ocsort_tracker.ocsort import OCSort
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
