@@ -4,3 +4,5 @@
 /rink_aware_hockey_tracking_results
 /oc_sort_hockey_results
 __pycache__/hockey_tracker.cpython-310.pyc
+*.png
+*.jpg

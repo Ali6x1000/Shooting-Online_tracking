@@ -7,7 +7,7 @@ Tracks puck trajectories that start in lower third and move toward net
 python test_ocsort.py shooting2.mp4 best_yolov11lv2_puck.pt
 
 # With net detection
-python test_ocsort.py shooting2.mp4 best_yolov11lv2_puck.pt --net-model net_model.pt
+python test_ocsort.py shooting2.mp4 best_yolov11lv2_puck.pt --net-model Nets_n.pt
 
 # Custom confidence and output
 python test_ocsort.py video.mp4 puck_model.pt --confidence 0.4 --output tracked_video.mp4
@@ -71,15 +71,17 @@ class HockeyPuckTracker:
         self.confidence_threshold = confidence_threshold
         
         # Initialize OC-SORT tracker with optimized parameters for hockey
+
+        # Play with these parameters  (ALI)
         self.tracker = OCSort(
             det_thresh=confidence_threshold,
-            max_age=15,          # Shorter for fast hockey action
-            min_hits=2,          # Quick confirmation
+            max_age=30,          # Shorter for fast hockey action
+            min_hits=5,          # Quick confirmation
             iou_threshold=0.25,  # Lower for fast movement
             delta_t=2,           # Short look-back
             asso_func="giou",    # Better for fast objects
             inertia=0.4,         # Higher inertia for smoother velocity
-            use_byte=True        # Enable ByteTrack-style matching
+            use_byte=False        # Enable ByteTrack-style matching
         )
         
         # Tracking storage
@@ -126,7 +128,59 @@ class HockeyPuckTracker:
                     })
         
         return nets
-    
+    def print_selected_trajectories(self, output_file="selected_trajectories.txt"):
+        """Save detailed information about all selected trajectories to a text file"""
+        with open(output_file, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write("SELECTED TRAJECTORIES SUMMARY\n")
+            f.write("="*80 + "\n")
+            f.write(f"Total selected shots: {len(self.selected_shots)}\n")
+            
+            if not self.selected_shots:
+                f.write("No trajectories were selected.\n")
+                return
+            
+            for i, shot in enumerate(self.selected_shots):
+                trajectory = shot['trajectory']
+                track_id = shot['track_id']
+                start_frame = shot['start_frame']
+                end_frame = shot['end_frame']
+                color = shot['color']
+                
+                f.write(f"\n--- Shot {i+1} (Track ID: {track_id}) ---\n")
+                f.write(f"Frames: {start_frame} to {end_frame} (Duration: {end_frame - start_frame + 1} frames)\n")
+                f.write(f"Total points: {len(trajectory)}\n")
+                f.write(f"Color (BGR): {color}\n")
+                
+                if trajectory:
+                    start_point = trajectory[0]
+                    end_point = trajectory[-1]
+                    f.write(f"Start position: ({start_point['x']:.1f}, {start_point['y']:.1f})\n")
+                    f.write(f"End position: ({end_point['x']:.1f}, {end_point['y']:.1f})\n")
+                    
+                    # Calculate trajectory stats
+                    total_distance = 0
+                    for j in range(1, len(trajectory)):
+                        prev = trajectory[j-1]
+                        curr = trajectory[j]
+                        dx = curr['x'] - prev['x']
+                        dy = curr['y'] - prev['y']
+                        total_distance += math.sqrt(dx*dx + dy*dy)
+                    
+                    f.write(f"Total distance traveled: {total_distance:.1f} pixels\n")
+                    
+                    # Write all trajectory points
+                    f.write(f"\nAll trajectory points:\n")
+                    f.write(f"{'Point':<6} {'Frame':<6} {'X':<8} {'Y':<8} {'Time(s)':<8}\n")
+                    f.write("-" * 40 + "\n")
+                    
+                    for j, point in enumerate(trajectory):
+                        f.write(f"{j+1:<6} {point['frame_num']:<6} {point['x']:<8.1f} "
+                            f"{point['y']:<8.1f} {point['timestamp']:<8.2f}\n")
+            
+            f.write("\n" + "="*80 + "\n")
+        
+    print(f"Selected trajectories saved")
     def detect_pucks(self, frame):
         """Detect pucks in the frame and convert to OCSort format"""
         results = self.puck_model.predict(frame, conf=self.confidence_threshold, verbose=False)
@@ -390,17 +444,40 @@ class HockeyPuckTracker:
         for net in nets:
             bbox = net['bbox'].astype(int)
             cv2.rectangle(annotated, (bbox[0], bbox[1]), (bbox[2], bbox[3]), 
-                         (0, 255, 255), 3)
+                        (0, 255, 255), 3)
             cv2.putText(annotated, f"NET ({net['confidence']:.2f})", 
-                       (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.6, (0, 255, 255), 2)
+                    (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.6, (0, 255, 255), 2)
         
         # Draw lower third line
         lower_third_y = int(self.video_height * (2/3))
         cv2.line(annotated, (0, lower_third_y), (self.video_width, lower_third_y), 
                 (255, 255, 255), 2)
         cv2.putText(annotated, "Lower Third", (10, lower_third_y - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # ===== ALWAYS DRAW ALL SELECTED SHOTS FIRST (so they appear in background) =====
+        for i, shot in enumerate(self.selected_shots):
+            trajectory = shot['trajectory']
+            color = shot['color']
+            track_id = shot['track_id']
+            
+            if len(trajectory) > 1:
+                points = [(int(p['x']), int(p['y'])) for p in trajectory]
+                
+                # Draw the complete trajectory path
+                for j in range(1, len(points)):
+                    cv2.line(annotated, points[j-1], points[j], color, 4)
+                
+                # Mark start and end points
+                cv2.circle(annotated, points[0], 8, (0, 255, 0), -1)   # Green start
+                cv2.circle(annotated, points[-1], 8, (0, 0, 255), -1) # Red end
+                
+                # Add shot label near the start
+                label_pos = points[min(3, len(points)-1)]  # Position label a few points in
+                cv2.putText(annotated, f"Shot {i+1} (ID:{track_id})", 
+                        (label_pos[0] + 10, label_pos[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         # Draw current detections
         if len(tracked_objects) > 0:
@@ -424,38 +501,43 @@ class HockeyPuckTracker:
                     label += " ACTIVE"
                 
                 cv2.putText(annotated, label, (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        # Draw trajectories for active tracks
+        # Draw trajectories for currently active tracks (in progress)
         for track_id in self.active_trajectories:
             if track_id in self.all_trajectories:
                 trajectory = self.all_trajectories[track_id]
                 if len(trajectory) > 1:
                     points = [(int(p['x']), int(p['y'])) for p in trajectory]
+                    # Draw with dashed/dotted effect for active tracks
                     for i in range(1, len(points)):
-                        cv2.line(annotated, points[i-1], points[i], (0, 255, 0), 2)
+                        if i % 2 == 0:  # Create dashed effect
+                            cv2.line(annotated, points[i-1], points[i], (0, 255, 0), 2)
         
-        # Draw selected shots
-        for shot in self.selected_shots:
-            trajectory = shot['trajectory']
-            color = shot['color']
-            if len(trajectory) > 1:
-                points = [(int(p['x']), int(p['y'])) for p in trajectory]
-                for i in range(1, len(points)):
-                    cv2.line(annotated, points[i-1], points[i], color, 3)
-                
-                # Mark start and end
-                if points:
-                    cv2.circle(annotated, points[0], 8, (0, 255, 0), -1)   # Green start
-                    cv2.circle(annotated, points[-1], 8, (0, 0, 255), -1) # Red end
-        
-        # Info text
+        # Enhanced info text with shot summary
         info_text = (f"Frame: {self.frame_count} | Active: {len(self.active_trajectories)} | "
                     f"Selected Shots: {len(self.selected_shots)}")
+        
+        # Draw text with background for better visibility
+        text_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.rectangle(annotated, (5, 5), (text_size[0] + 15, 40), (0, 0, 0), -1)
         cv2.putText(annotated, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (255, 255, 255), 2)
-        cv2.putText(annotated, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (0, 0, 0), 1)
+                0.7, (255, 255, 255), 2)
+        
+        # Add legend for selected shots
+        if self.selected_shots:
+            legend_y_start = 60
+            cv2.putText(annotated, "Selected Shots:", (10, legend_y_start), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            for i, shot in enumerate(self.selected_shots):
+                y_pos = legend_y_start + 25 + (i * 25)
+                color = shot['color']
+                track_id = shot['track_id']
+                # Draw a small line sample of the shot color
+                cv2.line(annotated, (10, y_pos), (40, y_pos), color, 4)
+                cv2.putText(annotated, f"Shot {i+1} (Track {track_id})", 
+                        (50, y_pos + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return annotated
     
@@ -631,9 +713,17 @@ def main():
     parser.add_argument('--net-model', help='Path to net detection YOLO model')
     parser.add_argument('--output', default='output_tracking.mp4', help='Output video path')
     parser.add_argument('--confidence', type=float, default=0.3, help='Detection confidence')
-    parser.add_argument('--output-dir', default='output', help='Output directory for plots')
+    parser.add_argument('--output-dir', default=None, help='Output directory for plots')
     
     args = parser.parse_args()
+    
+    # Set output directory to current script directory if not specified
+    if args.output_dir is None:
+        script_dir = Path(__file__).parent
+        args.output_dir = str(script_dir)
+    
+    # Create output directory if it doesn't exist
+    Path(args.output_dir).mkdir(exist_ok=True)
     
     # Create tracker
     tracker = HockeyPuckTracker(
@@ -645,6 +735,10 @@ def main():
     # Process video
     last_frame = tracker.process_video(args.video_path, args.output)
     
+    # Save all selected trajectories to text file in the script directory
+    trajectory_file = f"{args.output_dir}/selected_trajectories.txt"
+    tracker.print_selected_trajectories(trajectory_file)
+    
     # Create final frame with all shots
     final_frame = tracker.create_final_frame_with_all_shots(last_frame)
     cv2.imwrite(f"{args.output_dir}/final_frame_all_shots.jpg", final_frame)
@@ -655,6 +749,7 @@ def main():
     print("\nProcessing Complete!")
     print(f"Output video: {args.output}")
     print(f"Final frame: {args.output_dir}/final_frame_all_shots.jpg")
+    print(f"Trajectory data: {trajectory_file}")
     print(f"Trajectory plots: {args.output_dir}/")
 
 
